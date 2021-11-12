@@ -64,7 +64,7 @@ local coreOutput
 do -- environment setup
 	
 	local base, overwrite = {}, {} do
-
+		
 		base.getgenv = function()
 			return genv
 		end
@@ -77,13 +77,16 @@ do -- environment setup
 			if not exp then
 				func(...)
 			end
+			return exp, func, ...
 		end
 
 		assertf = function(exp, ...)
 			if not exp then
 				coreOutput.error(sformat(...), 3)
 			end
+			return exp, ...
 		end
+		base.assertf = assertf
 
 		asserttype = function(v, type)
 			local vtype = typeof(v)
@@ -91,6 +94,7 @@ do -- environment setup
 				coreOutput.error(sformat("<%s> expected, got \"%s\"", type, vtype), 3)
 			end
 		end
+		base.asserttype = asserttype
 
 		isifile = function(obj)
 			if type(obj) == "table" then
@@ -98,6 +102,7 @@ do -- environment setup
 				return meta and meta.__type == "File"
 			end
 		end
+		base.isifile = isifile
 
 		isifolder = function(obj)
 			if type(obj) == "table" then
@@ -106,9 +111,6 @@ do -- environment setup
 			end
 		end
 		
-		base.assertf = assertf
-		base.asserttype = asserttype
-		base.isifile = isifile
 		base.isifolder = isifolder
 		
 		base.printf = function(...)
@@ -203,6 +205,7 @@ do -- environment setup
 			return v
 		end
 
+		base.rprint = constants.print
 		overwrite.print = function(...)
 			local str = ""
 			for i = 1, select('#', ...) do
@@ -213,6 +216,7 @@ do -- environment setup
 			constants.print(str)
 		end
 
+		base.rwarn = constants.warn
 		overwrite.warn = function(...)
 			local str = ""
 			for i = 1, select('#', ...) do
@@ -293,7 +297,10 @@ do -- environment setup
 	end
 
 	local function wrapFunction(func)
-		return newcclosure(func)
+		if islclosure(func) then
+			return newcclosure(func)
+		end
+		return func
 	end
 
 	local function checkFunction(name, func, overwrite)
@@ -329,6 +336,77 @@ genv.oop = {
 	lockclass = lockclass,
 	inherit = inherit
 }
+
+
+--[[
+		Enums
+--]]
+
+
+local DEnums do
+	local nametag = math.random()
+	local parenttag = math.random()
+
+	DEnums = setmetatable({}, {
+		__index = function(_, k)
+			errorf("\"%s\" is not a valid member of DEnums", k)
+		end,
+
+		__tostring = function()
+			return "DEnums"
+		end
+	})
+
+
+	local EnumItem do
+		EnumItem = {
+			__index = function(self, k)
+				errorf("\"%s\" is not a valid member of %s.%s", self[parenttag][nametag], self[nametag])
+			end,
+			__tostring = function(self)
+				return string.format("DEnums.%s.%s", self[parenttag][nametag], self[nametag])
+			end
+		}
+
+		function EnumItem.new(enum, name)
+			asserttype(name, "string")
+
+			local self = {}
+			self[nametag] = name
+			self[parenttag] = enum
+			return setmetatable(self, EnumItem)
+		end
+	end
+
+	local Enum do
+		Enum = {
+			__index = function(self, k)
+				errorf("\"%s\" is not a valid member of enum %s", self[nametag])
+			end,
+			__tostring = function(self)
+				return self[nametag]
+			end
+		}
+
+		function Enum.new(name, t)
+			asserttype(name, "string")
+			assertf(rawget(DEnums, name) == nil, "enum %s already exist", name)
+
+			local self = {}
+			DEnums[name] = self
+			self[nametag] = name
+
+			for _, itemName in pairs(t) do
+				self[itemName] = EnumItem.new(self, itemName)
+			end
+
+			return setmetatable(self, Enum)
+		end
+	end
+
+	genv.DEnums = DEnums
+	genv.NewEnum = Enum.new
+end
 
 
 --[[
@@ -611,15 +689,17 @@ local moduleProvider = {} do
 			self._Name = name
 			self._Data = {}
 			self._CoreConnections = {}
+			self.Active = true
 			
 			-- create global variables in script
 			core._Temp.CurrentModule = self
 			local chunk, err = loadstring(
-				"module = core._Temp.CurrentModule;" ..
+				"local module = core._Temp.CurrentModule;" ..
 				"core._Temp.CurrentModule = nil;" ..
-				"moduledata = module._Data;" ..
-				"globalstorage = storage;" ..
-				moduleFile:Read()
+				"local moduledata = module._Data;" ..
+				"local globalstorage = storage;" ..
+				moduleFile:Read(),
+				name
 			)
 			
 			if chunk then
@@ -634,10 +714,14 @@ local moduleProvider = {} do
 	function moduleProvider:GetModule(name)
 		return loadedModules[name]
 	end
-
+	
+	function moduleProvider:GetLoadedModules()
+		return loadedModules
+	end
+	
 	function moduleProvider:UnloadModule(name)
 		local module = loadedModules[name]
-		assertf(name, "module \"%s\" is not loaded", name)
+		assertf(module, "module \"%s\" is not loaded", name)
 		module:Unload()
 	end
 
@@ -653,7 +737,13 @@ local moduleProvider = {} do
 		end
 		self:LoadModule(name)
 	end
-
+	
+	function moduleProvider:Include(name)
+		local module = self:GetModule(name) or self:LoadModule(name)
+		asserttype(module._Data.ModuleFields, "table", "Included modules must contain table \"ModuleFields\" in moduledata")
+		return module._Data.ModuleFields
+	end
+	
 	function moduleProvider:ReloadModule(name)
 		local module = loadedModules[name]
 		assertf(name, "module \"%s\" is not loaded", name)
@@ -795,7 +885,8 @@ core = {} do
 			"fields = service._Fields;" ..
 			"service = nil;" ..
 			"globalstorage = storage;" ..
-			serviceFile:Read()
+			serviceFile:Read(),
+			serviceName
 		)
 
 		if chunk then
@@ -816,23 +907,24 @@ core = {} do
 	
 	function core.new()
 		local self = setmetatable({}, core)
+		core = self
 		setreadonly(self, true)
 		genv.core = self
 		
-		for _, service in ipairs(core.Services:GetChildren()) do
+		for _, service in ipairs(self.Services:GetChildren()) do
 			if service:IsA("File") then
 				coroutine.wrap(newService)(service)
 			end
 		end
 		
-		for _, module in ipairs(core.InitModules:GetChildren()) do
+		for _, module in ipairs(self.InitModules:GetChildren()) do
 			if module:IsA("File") then
-				coroutine.wrap(core._LoadInitModule)(core, module)
+				coroutine.wrap(self._LoadInitModule)(self, module)
 			end
 		end
 		
 		return self
 	end
 	
-	core = core.new()
+	core.new()
 end
