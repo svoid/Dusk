@@ -12,9 +12,10 @@ local InstanceProtoTags = NewEnum("InstanceProtoTag", {
 	"AddToReturnPool"
 })
 
+local Dump = game:GetService("HttpService"):JSONDecode(storage.ApiDump:Read()).Classes
+
 local classes = {}
 
-local Dump = game:GetService("HttpService"):JSONDecode(storage.ApiDump:Read()).Classes
 for _, classData in ipairs(Dump) do
 	local className = classData.Name
 	if className == "Studio" then continue end
@@ -196,11 +197,9 @@ end
 
 local function serialize(obj, identity, attributes, isTagged)
 	layer = 0
-	str = "structure = "
+	str = ""
 	serializeMember(obj, identity, attributes, isTagged)
-	local structure = Instance.new("StringValue", workspace)
-	structure.Name = "saved"
-	structure.Value = str
+	return str
 end
 
 
