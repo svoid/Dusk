@@ -15,6 +15,7 @@ local settings = {
 	printe_max_layer = 12,
 	print_tab_string = "    ", -- console shortens \t
 	print_use_type_instead_tostring = true,
+	print_ignore_tostring_metatable = false,
 	print_add_instance_class_name = true,
 	print_normalize_string = true,
 	print_add_closure_type = true,
@@ -55,7 +56,6 @@ local isfolder = isfolder
 local delfolder = delfolder
 local delfile = delfile
 
-local checktype
 local assertf
 local isifile
 
@@ -64,64 +64,77 @@ local coreOutput
 do -- environment setup
 	
 	local base, overwrite = {}, {} do
-		
-		base.getgenv = function()
-			return genv
-		end
-
-		base.iscclosure = function(func)
-			return not islclosure(func)
-		end
-
-		base.assertcall = function(exp, func, ...)
-			if not exp then
-				func(...)
-			end
-			return exp, func, ...
-		end
-
-		assertf = function(exp, ...)
+		function assertf(exp, ...)
 			if not exp then
 				coreOutput.error(sformat(...), 3)
 			end
 			return exp, ...
 		end
-		base.assertf = assertf
-
-		asserttype = function(v, type)
-			local vtype = typeof(v)
-			if vtype ~= type then
-				coreOutput.error(sformat("<%s> expected, got \"%s\"", type, vtype), 3)
-			end
-		end
-		base.asserttype = asserttype
-
-		isifile = function(obj)
+		
+		function isifile(obj)
 			if type(obj) == "table" then
 				local meta = getrawmetatable(obj)
 				return meta and meta.__type == "File"
 			end
 		end
-		base.isifile = isifile
-
-		isifolder = function(obj)
+		
+		local function iscclosure(func)
+			return not islclosure(func)
+		end
+		
+		local function assertcall(exp, func, ...)
+			if not exp then
+				func(...)
+			end
+			return exp, func, ...
+		end
+		
+		local function tobool(v)
+			return (v == 1 or v == "true" or v == "1" or v == true) and true or false
+		end
+		
+		local canaccesspermission = function(identity, permission)
+			if not permission then
+				return true
+			end
+			if identity == 1 or identity == 4 then
+				return tobool(bit32.band((permission - 1), 0xFFFFFFFD))
+			elseif identity == 3 or identity == 6 then
+				return not tobool((bit32.band((permission - 1), 0xFFFFFFF9))) and permission ~= 7
+			elseif identity == 5 then
+				return permission == 1
+			elseif identity == 7 or identity == 8 then
+				return true
+			elseif identity == 9 then
+				return permission - 4 <= 1
+			else
+				return false
+			end
+		end
+		
+		local function asserttype(v, type)
+			local vtype = typeof(v)
+			if vtype ~= type then
+				coreOutput.error(sformat("<%s> expected, got \"%s\"", type, vtype), 3)
+			end
+		end
+		
+		local function isifolder(obj)
 			if type(obj) == "table" then
 				local meta = getrawmetatable(obj)
 				return meta and meta.__type == "Folder"
 			end
 		end
 		
-		base.isifolder = isifolder
-		
-		base.printf = function(...)
+		local function printf(...)
 			coreOutput.print(sformat(...))
 		end
-
-		base.warnf = function(...)
+		
+		local function warnf(...)
 			coreOutput.warn(sformat(...))
 		end
-
-		base.errorf = function(...)
+		
+		local function errorf(...)
 			coreOutput.error(sformat(...), 2)
 		end
 
@@ -155,12 +168,10 @@ do -- environment setup
 			end
 		end
 
-		base.fescape = formatEscape
-
 		local function formatValue(v)
 			local vtype = type(v)
 			if vtype == "string" then
-				v = sformat("\"%s\"", formatEscape(v))
+				v = string.format("\"%s\"", formatEscape(v))
 				if settings.print_normalize_string then
 					local success, normalized = pcall(unormalize, v)
 					v = success and normalized or v
@@ -168,75 +179,86 @@ do -- environment setup
 				return v
 			elseif vtype == "table" then
 				if settings.print_use_type_instead_tostring then
+					local mt = getmetatable(v)
+					if mt and rawget(mt, "__tostring") and settings.print_ignore_tostring_metatable then
+						return tostring(v)
+					end
 					return "<table>"
 				end
-				local mt = getrawmetatable(v) or getmetatable(v)
-				if mt and mt.__tostring then
-					return "[table has __tostring]"
+				local mt = getmetatable(v)
+				if mt and rawget(mt, "__tostring") and not settings.print_ignore_tostring_metatable then
+					return "*** table has __tostring ***"
 				end
 				return v
 			elseif vtype == "userdata" then
 				vtype = typeof(v)
 				if vtype == "Instance" then
-					v = sformat(
+					v = string.format(
 						"Instance: %s\"%s\"",
 						settings.print_add_instance_class_name and v.ClassName .. ": " or "",
 						formatEscape(v:GetFullName())
 					)
-
+					
 					if settings.print_normalize_string then
 						local success, normalized = pcall(unormalize, v)
 						return success and normalized or v
 					end
 					return v
 				else
-					return sformat(
+					return string.format(
 						"%s(%s)",
 						vtype,
 						settings.print_use_type_instead_tostring and "<" .. vtype .. ">" or v
 					)
 				end
 			elseif vtype == "vector" then
-				return sformat("Vector3(%s)", tostring(v))
+				return string.format("Vector3(%s)", tostring(v))
 			elseif vtype == "function" then
 				return formatFunction(v)
 			end
-
+			
 			return v
 		end
-
-		base.rprint = constants.print
-		overwrite.print = function(...)
+		
+		local function processformattedoutput(...)
 			local str = ""
 			for i = 1, select('#', ...) do
 				local v = tostring(formatValue(select(i, ...)))
 				assert(type(v) == "string", "'tostring' must return a string to 'print'")
-				str = str .. v .. " "
+				str ..= v .. " "
 			end
-			constants.print(str)
+			return str
 		end
-
-		base.rwarn = constants.warn
-		overwrite.warn = function(...)
+		
+		local function processoutput(...)
 			local str = ""
 			for i = 1, select('#', ...) do
-				local v = tostring(formatValue(select(i, ...)))
-				assert(type(v) == "string", "'tostring' must return a string to 'warn'")
-				str = str .. v .. " "
+				local v = tostring(tostring(select(i, ...)))
+				assert(type(v) == "string", "'tostring' must return a string to 'print'")
+				str ..= v .. " "
 			end
-			constants.warn(str)
+			return str
 		end
-
-		base.printl = function(t)
+		
+		local function overwrite_print(...)
+			constants.print(processformattedoutput(...))
+		end
+		
+		local function overwrite_warn(...)
+			constants.warn(processformattedoutput(...))
+		end
+		
+		
+		local function printl(t)
 			local print = coreOutput.print
-
+			
 			for i, v in pairs(t) do
 				print(i, formatValue(v))
 			end
 		end
 
 		local printedTables = {}
-		base.printe = function(...)
+		local function printe(...)
 			local print = coreOutput.print
 			local tab = settings.print_tab_string
 			local maxLayer = settings.printe_max_layer
@@ -244,8 +266,7 @@ do -- environment setup
 			local layer = 0
 			tclear(printedTables)
 
-			local printl
-			function printl(t)
+			local function printl(t)
 				if layer == maxLayer then return end
 
 				local tab = srep(tab, layer)
@@ -266,9 +287,8 @@ do -- environment setup
 				end
 			end
 
-			local v
-			for i = 1, select('#', ...) do
-				v = select(i, ...)
+			for i = 1, select("#", ...) do
+				local v = select(i, ...)
 				if type(v) == "table" then
 					printl(v)
 				else
@@ -276,10 +296,10 @@ do -- environment setup
 				end
 			end
 		end
-
+		
 		local rawrequire = require
 
-		overwrite.require = function(obj)
+		local function overwrite_require(obj)
 			if isifile(obj) then
 				local chunk, err = loadstring(obj:Read())
 				if chunk then
@@ -289,6 +309,30 @@ do -- environment setup
 			end
 			return rawrequire(obj)
 		end
+		
+		
+		base.iscclosure = iscclosure
+		base.assertcall = assertcall
+		base.tobool = tobool
+		base.canaccesspermission = canaccesspermission
+		base.assertf = assertf
+		base.asserttype = asserttype
+		base.isifile = isifile
+		base.isifolder = isifolder
+		base.printf = printf
+		base.warnf = warnf
+		base.errorf = errorf
+		base.fescape = formatEscape
+		base.rprint = constants.print
+		base.rwarn = constants.warn
+		base.printl = printl
+		base.printe = printe
+		
+		base.processoutput = processoutput
+		base.processformattedoutput = processformattedoutput
+		overwrite.print = overwrite_print
+		overwrite.warn = overwrite_warn
+		overwrite.require = overwrite_require
 	end
 
 
@@ -322,6 +366,7 @@ end
 local function lockclass(t, type)
 	t.__type = type
 	t.__metatable = "The metatable is locked"
+	t.__protected = true
 	setreadonly(t, true)
 end
 
@@ -368,12 +413,13 @@ local DEnums do
 			end
 		}
 
-		function EnumItem.new(enum, name)
+		function EnumItem.new(enum, name, value)
 			asserttype(name, "string")
 
 			local self = {}
 			self[nametag] = name
 			self[parenttag] = enum
+			self.Value = value
 			return setmetatable(self, EnumItem)
 		end
 	end
@@ -381,23 +427,29 @@ local DEnums do
 	local Enum do
 		Enum = {
 			__index = function(self, k)
-				errorf("\"%s\" is not a valid member of enum %s", self[nametag])
+				errorf("\"%s\" is not a valid member of enum %s", k, self[nametag])
 			end,
 			__tostring = function(self)
 				return self[nametag]
 			end
 		}
 
-		function Enum.new(name, t)
+		function Enum.new(name, t, hasValue)
 			asserttype(name, "string")
 			assertf(rawget(DEnums, name) == nil, "enum %s already exist", name)
 
 			local self = {}
 			DEnums[name] = self
 			self[nametag] = name
-
-			for _, itemName in pairs(t) do
-				self[itemName] = EnumItem.new(self, itemName)
+			
+			if hasValue then
+				for itemName, value in pairs(t) do
+					self[itemName] = EnumItem.new(self, itemName, value)
+				end
+			else
+				for _, itemName in pairs(t) do
+					self[itemName] = EnumItem.new(self, itemName)
+				end
 			end
 
 			return setmetatable(self, Enum)
@@ -428,6 +480,7 @@ local ohandler = {} do
 		return self
 	end
 	
+	genv.OHandler = ohandler
 	lockclass(ohandler, "OutputHandler")
 end
 
@@ -454,7 +507,7 @@ local osinstance = {} do
 		return self.ClassName == className
 	end
 	
-	lockclass(osinstance)
+	lockclass(osinstance, "osinstance")
 end
 
 local file
@@ -617,27 +670,21 @@ local moduleProvider = {} do
 		end
 		
 		local recursiveWipe do
-			local wipedTables = {}
-			
 			local wipe
 			function wipe(t)
-				if tfind(wipedTables, t) then return end
-				tinsert(wipedTables, t)
-				
 				for i, v in pairs(t) do
+					rawset(t, i, nil)
 					local vtype = typeof(v)
 					if vtype == "table" then
 						wipe(v)
 					elseif vtype == "RBXScriptConnection" then
 						v:Disconnect()
 					end
-					rawset(t, i, nil)
 				end
 			end
 			
 			function recursiveWipe(t)
 				wipe(t)
-				tclear(wipedTables)
 			end
 		end
 		
@@ -679,7 +726,7 @@ local moduleProvider = {} do
 			return core.ModuleStorage:GetFolder(self._Name)
 		end
 		
-		function module.new(moduleFile)
+		function module.new(moduleFile, ...)
 			local name = moduleFile.Name
 			assertf(moduleProvider:GetModule(name) == nil, "module \"%s\" already loaded", name)
 			
@@ -693,11 +740,14 @@ local moduleProvider = {} do
 			
 			-- create global variables in script
 			core._Temp.CurrentModule = self
-			local chunk, err = loadstring(
-				"local module = core._Temp.CurrentModule;" ..
-				"core._Temp.CurrentModule = nil;" ..
-				"local moduledata = module._Data;" ..
-				"local globalstorage = storage;" ..
+			core._Temp.Arguments = {...}
+			local chunk, err = loadstring(sgsub([[
+				module = core._Temp.CurrentModule;
+				moduledata = module._Data;
+				modulearguments = core._Temp.Arguments
+				globalstorage = storage;
+				core._Temp.CurrentModule = nil;
+				core._Temp.Arguments = nil;]], "\n", " ") ..
 				moduleFile:Read(),
 				name
 			)
@@ -712,6 +762,7 @@ local moduleProvider = {} do
 	end
 
 	function moduleProvider:GetModule(name)
+		asserttype(name, "string")
 		return loadedModules[name]
 	end
 	
@@ -720,18 +771,21 @@ local moduleProvider = {} do
 	end
 	
 	function moduleProvider:UnloadModule(name)
+		asserttype(name, "string")
 		local module = loadedModules[name]
 		assertf(module, "module \"%s\" is not loaded", name)
 		module:Unload()
 	end
 
 	function moduleProvider:LoadModule(name)
+		asserttype(name, "string")
 		local moduleFile = core.Modules[name]
 		assertf(moduleFile, "cannot find module \"%s\"", name)
 		return module.new(moduleFile)
 	end
 
 	function moduleProvider:LoadClearModule(name)
+		asserttype(name, "string")
 		if self:GetModule(name) then
 			self:UnloadModule(name)
 		end
@@ -739,6 +793,7 @@ local moduleProvider = {} do
 	end
 	
 	function moduleProvider:Include(name)
+		asserttype(name, "string")
 		local module = self:GetModule(name) or self:LoadModule(name)
 		asserttype(module._Data.ModuleFields, "table", "Included modules must contain table \"ModuleFields\" in moduledata")
 		return module._Data.ModuleFields
@@ -819,7 +874,7 @@ core = {} do
 		warn = coreWarn,
 		error = constants.error,
 	})
-
+	
 	function core:GetOutput()
 		return coreOutput
 	end
@@ -832,14 +887,14 @@ core = {} do
 	
 	local loadedServices = {}
 	
-	function core:GetService(name)
-		return loadedServices[name]
-	end
-	
 	local function newService(serviceFile)
 		local serviceName = serviceFile.Name
 		assertf(loadedServices[serviceName] == nil, "service \"%s\" already loaded", serviceName)
-
+		
+		if serviceFile:IsA("Folder") then
+			serviceFile = serviceFile.Main
+		end
+		
 		local methods = {}
 		local fields = {
 			ClassName = serviceName
@@ -851,20 +906,9 @@ core = {} do
 			
 			__index = function(_, index)
 				asserttype(index, "string")
-
-				for i, v in pairs(methods) do
-					if i == index then
-						return v
-					end
-				end
-
-				for i, v in pairs(fields) do
-					if i == index then
-						return v
-					end
-				end
-
-				errorf("\"%s\" is not a valid member of \"%s\"", index, serviceName)
+				return methods[index]
+					or fields[index]
+					or errorf("\"%s\" is not a valid member of \"%s\"", index, serviceName)
 			end,
 			
 			__newindex = function(_, index, newValue)
@@ -878,13 +922,16 @@ core = {} do
 		
 		-- create global variables in service
 		core._Temp.CurrentService = service
-		local chunk, err = loadstring(
-			"service = core._Temp.CurrentService;" ..
-			"core._Temp.CurrentService = nil;" ..
-			"methods = service._Methods;" ..
-			"fields = service._Fields;" ..
-			"service = nil;" ..
-			"globalstorage = storage;" ..
+		core._Temp.CurrentServiceStorage = core.Services ~= serviceFile.Parent and serviceFile.Parent
+		local chunk, err = loadstring(sgsub([[
+			service = core._Temp.CurrentService;
+			storage = core._Temp.CurrentServiceStorage;
+			methods = service._Methods;
+			fields = service._Fields;
+			globalstorage = storage;
+			core._Temp.CurrentService = nil;
+			core._Temp.CurrentServiceFile = nil;
+			service = nil;]], "\n", " ") ..
 			serviceFile:Read(),
 			serviceName
 		)
@@ -899,6 +946,9 @@ core = {} do
 		error(err, 3)
 	end
 	
+	function core:GetService(name)
+		return loadedServices[name] or newService(assert(self.Services[name], "invalid service name"))
+	end
 
 	--[[
 			Main
@@ -910,12 +960,6 @@ core = {} do
 		core = self
 		setreadonly(self, true)
 		genv.core = self
-		
-		for _, service in ipairs(self.Services:GetChildren()) do
-			if service:IsA("File") then
-				coroutine.wrap(newService)(service)
-			end
-		end
 		
 		for _, module in ipairs(self.InitModules:GetChildren()) do
 			if module:IsA("File") then
