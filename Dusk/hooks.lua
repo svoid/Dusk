@@ -1,4 +1,5 @@
--- Hook:IsTargetedTo should stay inlined in hook handlers due to optimization reasons
+writefile("INDEXLOG.txt", "")
+writefile("NAMECALLLOG.txt", "")
 
 local Hook = {} do
 	
@@ -16,7 +17,8 @@ end
 local HookType = {
 	Name = "Name",
 	Instance = "Instance",
-	Both = "Both"
+	Both = "Both",
+	None = "None"
 }
 
 local function getHookType(name, instance)
@@ -28,6 +30,8 @@ local function getHookType(name, instance)
 		end
 	elseif instance then
 		return HookType.Instance
+	else
+		return HookType.None
 	end
 end
 
@@ -117,6 +121,10 @@ local TargetedHookHandler = {} do
 	end
 	
 	function TargetedHookHandler:NewHook(name, instanceOrFunction1, instanceOrFunction2)
+		if type(name) == "function" then
+			return self.HookConstructor(nil, nil, name)
+		end
+		
 		expectType(name, "string")
 		
 		local instance
@@ -139,6 +147,7 @@ local TargetedHookHandler = {} do
 	buildFinalClass("TargetedHookHandler", TargetedHookHandler, DuskObject)
 end
 
+
 local GameIndexHookHandler = {} do
 	
 	function GameIndexHookHandler.new()
@@ -151,15 +160,22 @@ local GameIndexHookHandler = {} do
 		
 		rawindex = hookmetamethod(game, "__index", function(instance, fieldName)
 			
+			if checkcaller() and not isduskthread() then
+				appendfile("INDEXLOG.txt", tostring(instance) .. "." .. fieldName .. "\n")
+			end
+			
 			for _, hook in next, hooks do
 				
-				if hook.Type == HookType.Both then
-					if not (hook.FieldName == fieldName and hook.Instance == instance) then
-						continue
-					end
-				else
-					if not (hook.FieldName == fieldName or hook.Instance == instance) then
-						continue
+				local hookType = hook.Type
+				if hookType ~= HookType.None then
+					if hookType == HookType.Both then
+						if not (hook.FieldName == fieldName and hook.Instance == instance) then
+							continue
+						end
+					else
+						if not (hook.FieldName == fieldName or hook.Instance == instance) then
+							continue
+						end
 					end
 				end
 				
@@ -172,7 +188,7 @@ local GameIndexHookHandler = {} do
 			return rawindex(instance, fieldName)
 		end)
 		
-		self.RawNamecall = rawindex
+		self.RawIndex = rawindex
 		
 		return self
 	end
@@ -190,21 +206,30 @@ local GameNamecallHookHandler = {} do
 		local hooks = self.Hooks
 		local rawnamecall
 		
-		rawnamecall = hookmetamethod(game, "__namecall", function(...)
-			local instance = ...
+		rawnamecall = hookmetamethod(game, "__namecall", function(instance, ...)
 			local methodName = getnamecallmethod()
 			
+			if checkcaller() and not isduskthread() then
+				local str = ""
+				for i = 1, select("#", ...) do
+					str ..= tostring(select(i, ...)) .. " "
+				end
+				appendfile("NAMECALLLOG.txt", tostring(instance) .. ":" .. methodName .. "(" .. str .."\n")
+			end
 			
 			for _, hook in next, hooks do
 				
 				
-				if hook.Type == HookType.Both then
-					if not (hook.MethodName == methodName and hook.Instance == instance) then
-						continue
-					end
-				else
-					if not (hook.MethodName == methodName or hook.Instance == instance) then
-						continue
+				local hookType = hook.Type
+				if hookType ~= HookType.None then
+					if hook.Type == HookType.Both then
+						if not (hook.MethodName == methodName and hook.Instance == instance) then
+							continue
+						end
+					else
+						if not (hook.MethodName == methodName or hook.Instance == instance) then
+							continue
+						end
 					end
 				end
 				
@@ -215,7 +240,7 @@ local GameNamecallHookHandler = {} do
 				end
 			end
 			
-			return rawnamecall(...)
+			return rawnamecall(instance, ...)
 		end)
 		
 		self.RawNamecall = rawnamecall
@@ -237,16 +262,24 @@ local HookHandler = {} do
 		return self
 	end
 	
-	function HookHandler:HookFunciton(target, hook)
+	function HookHandler:HookFunction(target, hook)
+		if target == self.GameIndexHookHandler.RawIndex then
+			return self:HookGameIndex(nil, nil, hook)
+		elseif target == self.GameNamecallHookHandler.RawNamecall then
+			return self:HookGameNamecall(nil, nil, hook)
+		end
 		return hookfunction(target, hook)
 	end
 	
 	function HookHandler:HookGameIndex(name, instance, handler)
 		self.GameIndexHookHandler:NewHook(name, instance, handler)
+		return self.GameIndexHookHandler.RawIndex
 	end
 	
 	function HookHandler:HookGameNamecall(name, instance, handler)
 		self.GameNamecallHookHandler:NewHook(name, instance, handler)
+		warn(self.GameNamecallHookHandler.RawNamecall)
+		return self.GameNamecallHookHandler.RawNamecall
 	end
 	
 	buildFinalSingleton("HookHandler", HookHandler, DuskObject)

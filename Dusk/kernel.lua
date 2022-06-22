@@ -1,19 +1,21 @@
-syn.set_thread_identity(8)
-
+local DUSK_THREAD_IDENTITY = 8
 local CORE_FOLDER = "Dusk"
 local BASE_LIB_PATH = CORE_FOLDER .. "//blib.lua"
 local SETTINGS_PATH = CORE_FOLDER .. "//kernel.config"
 local FS_PATH = CORE_FOLDER .. "//fs.lua"
 local HOOK_HANDLER_PATH = CORE_FOLDER .. "//hooks.lua"
 local USER_PATH = CORE_FOLDER .. "//user.lua"
+local AUDITOR_LOG_PATH = CORE_FOLDER .. "log.txt"
 
-local rawReadfile = readfile
-local rawWritefile = writefile
+local raw_readfile = readfile
+local raw_writefile = writefile
+local raw_appendfile = appendfile
 
 local function loadfile(path, name)
-	return loadstring(rawReadfile(path), name)
+	return loadstring(raw_readfile(path), name)
 end
 
+syn.set_thread_identity(DUSK_THREAD_IDENTITY)
 
 
 --[[
@@ -22,7 +24,12 @@ end
 
 
 
-local environment
+local untrustedEnvironment = getgenv()
+local trustedEnvironment = setmetatable({}, {__index = getrenv()})
+
+local duskGlobalEnvironment = getfenv()
+setrawmetatable(duskGlobalEnvironment, {__index = untrustedEnvironment})
+
 local rawSettings
 
 local fs
@@ -36,11 +43,14 @@ local rootFolder
 local patchHandler
 
 do
-	local initData = {}
+	local initData = {
+		UntrustedEnvironment = untrustedEnvironment,
+		TrustedEnvironment = trustedEnvironment
+	}
 	
 	
 	local function loadSettings()
-		rawSettings = game:GetService("HttpService"):JSONDecode(rawReadfile(SETTINGS_PATH))
+		rawSettings = game:GetService("HttpService"):JSONDecode(raw_readfile(SETTINGS_PATH))
 		initData.RawSettings = rawSettings
 	end
 	
@@ -51,7 +61,7 @@ do
 	
 	local function loadFileSystem()
 		fs = assert(loadfile(FS_PATH, "fs")(initData))
-		environment.fs = fs
+		trustedEnvironment.fs = fs
 		rootFolder = initData.RootFolder
 	end
 	
@@ -178,8 +188,7 @@ do
 	end
 	
 	local function createEnvironment()
-		environment = {}
-		initData.Environment = environment
+		initData.Environment = trustedEnvironment
 	end
 	
 	-- no requirements
@@ -250,6 +259,69 @@ local kernelSettings do
 	kernelSettings = KernelSettings.new(rawSettings)
 end
 
+
+local kernelAuditor do
+	
+	local KernelAuditor = {} do
+		
+		function KernelAuditor.new()
+			local self = setmetatable({}, KernelAuditor)
+			
+			self.Buffer = ""
+			self.BufferSize = 0
+			
+			self.BufferWriteIndex = 0
+			self.MaxBufferSize = 2000
+			
+			self.NoDelay = false
+			self.WriteDelayTime = 5
+			self.LastBufferInputTime = 0
+			self.FirstBufferInputTime = nil
+			
+			raw_writefile(AUDITOR_LOG_PATH, "")
+			
+			return self
+		end
+		
+		function KernelAuditor:Write()
+			raw_appendfile(AUDITOR_LOG_PATH, self.Buffer)
+			self.Buffer = ""
+			self.BufferSize = 0
+			self.FirstBufferInputTime = nil
+		end
+		
+		local printLog = kernelSettings:GetField("PrintKernelLog")
+		function KernelAuditor:Log(content)
+			if printLog then
+				print(content)
+			end
+			
+			content ..= "\n"
+			raw_appendfile(AUDITOR_LOG_PATH, content)
+			
+			-- TODO: implement file buffer class
+			--[[
+			self.Buffer ..= content
+			self.BufferSize = #self.Buffer
+			
+			if not self.FirstBufferInputTime then
+				self.FirstBufferInputTime = tick()
+			end
+			
+			if self.BufferSize > self.MaxBufferSize 
+				or self.FirstBufferInputTime > self.WriteDelayTime
+			then
+				self:Write()
+			end
+			]]
+		end
+		
+		baseLibrary.buildFinalSingleton("KernelAuditor", KernelAuditor, KernelObject)
+	end
+	
+	kernelAuditor = KernelAuditor.new()
+end
+
 local libraryHandler do
 	
 	local LibraryHandler = {} do
@@ -275,60 +347,75 @@ local libraryHandler do
 		function LibraryHandler.new()
 			local self = setmetatable({}, LibraryHandler)
 			
-			self._Libraries = {}
+			self._Helpers = {}
 			
 			return self
 		end
 		
 		function LibraryHandler:Destroy()
-			local libraries = self._Libraries
-			for i, helper in ipairs(libraries) do
+			for i, helper in ipairs(self._Helpers) do
 				helper:Destroy()
-				libraries[i] = nil
 			end
+			table.clear(self._Helpers)
 		end
 		
-		function LibraryHandler:GetLibrary(name)
-			for _, helper in ipairs(self._Libraries) do
+		-- return library content
+		function LibraryHandler:GetLoadedLibrary(name)
+			for _, helper in ipairs(self._Helpers) do
 				if helper.Name == name then
 					return helper.Library
 				end
 			end
-			
-			local library = kernelVariables.KernelLibraries[name]
+		end
+		
+		function LibraryHandler:FindLibraryFile(name)
+			return kernelVariables.KernelLibraries[name]
+				or  kernelVariables.UserLibraries[name]
+		end
+		
+		-- get library content, loaded it if its not loaded yet
+		function LibraryHandler:GetLibrary(name)
+			local library = self:GetLoadedLibrary(name)
 			if library then
-				return self:InitLibrary(library, name)
+				return library
 			end
 			
-			local library = kernelVariables.UserLibraries[name]
-			if library then
-				return self:InitLibrary(library, name)
+			local libraryFile = self:FindLibraryFile(name)
+			if libraryFile then
+				return self:_RunLibrary(libraryFile)
 			end
 		end
 		
 		function LibraryHandler:AddLibrary(library, name)
 			local helper = LibraryHelper.new(library, name)
-			table.insert(self._Libraries, helper)
+			table.insert(self._Helpers, helper)
 			return library
 		end
 		
+		-- run library file and return it's content
 		function LibraryHandler:_RunLibrary(libraryFile)
+			kernelAuditor:Log("LibraryHandler:RunLibrary:", libraryFile.Path)
 			
-			if type(libraryFile) == "string" then
-				self:GetLibrary(libraryFile)
-				return
-			end
-			
-			local closure = loadstring(libraryFile:Read(), libraryFile.Name)
+			local libraryName = libraryFile.Name
+			local closure = loadstring(libraryFile:Read(), libraryName)
 			assert(type(closure) ~= "string", closure)
 			
-			kernel:_InjectEnvironment(closure)
+			local libraryContent = closure()
+			self:AddLibrary(libraryContent, libraryName)
 			
-			return closure()
+			return libraryContent
 		end
 		
-		function LibraryHandler:InitLibrary(libraryFile, name)
-			return self:AddLibrary(self:_RunLibrary(libraryFile), name)
+		-- run library file
+		function LibraryHandler:InitLibrary(nameOrFile)
+			if type(nameOrFile) == "string" then
+				self:GetLibrary(nameOrFile)
+			else
+				local libraryFile = baseLibrary.expectClass(nameOrFile, "File")
+				if not self:GetLoadedLibrary(nameOrFile.Name) then
+					self:_RunLibrary(libraryFile)
+				end
+			end
 		end
 		
 		baseLibrary.buildFinalSingleton("LibraryHandler", LibraryHandler, KernelObject)
@@ -442,9 +529,9 @@ local userModuleHandler, kernelModuleHandler do
 		
 		function KernelModuleHandler:LoadModule(name)
 			local moduleFile = kernelVariables.KernelModules[name]
+			kernelAuditor:Log("KernelModuleHandler:LoadModule:", moduleFile.Path)
 			
 			local closure = loadstring(moduleFile:Read(), name)
-			kernel:_InjectEnvironment(closure)
 			
 			local module = KernelModule.new(name, closure)
 			
@@ -517,8 +604,6 @@ local userModuleHandler, kernelModuleHandler do
 			local closure, error = loadstring(self.Source, self.Name)
 			
 			assert(closure, error)
-			
-			kernel:_InjectEnvironment(closure)
 			
 			local module = UserModule.new(self, self.Name, closure, self.Hash)
 			self:_AddModule(module)
@@ -620,6 +705,7 @@ local userModuleHandler, kernelModuleHandler do
 			
 			if type(moduleFileOrString) == "string" then
 				moduleFile = self:FindModuleFile(moduleFileOrString)
+				baseLibrary.assertf(moduleFile, "unable to find module '%s'", moduleFileOrString)
 			end
 			
 			local helper = self:GetHelper(moduleFile)
@@ -635,7 +721,6 @@ local userModuleHandler, kernelModuleHandler do
 			
 			if type(nameOrFile) == "string" then
 				moduleFile = self:FindModuleFile(nameOrFile)
-				
 				baseLibrary.assertf(moduleFile, "unable to find module '%s'", nameOrFile)
 			else
 				baseLibrary.expectClass(nameOrFile)
@@ -643,6 +728,7 @@ local userModuleHandler, kernelModuleHandler do
 				moduleFile = nameOrFile
 			end
 			
+			kernelAuditor:Log("UserModuleHandler:LoadModule:", moduleFile.Path)
 			self:NewModule(moduleFile):Run()
 		end
 		
@@ -683,54 +769,267 @@ end
 
 local Kernel = {} do
 	
-	local function setupEnvironment()
-		environment.PatchHandler = patchHandler
-		environment.DuskObject = DuskObject
+	local function copy(t)
 		
-		for name, value in pairs(baseLibrary) do
-			environment[name] = value
+		local result = {}
+		
+		for i, v in pairs(t) do
+			if type(v) == "table" then
+				result[i] = copy(v)
+			else
+				result[i] = v
+			end
 		end
+		
+		return result
+	end
+	
+	local original = copy(untrustedEnvironment)
+	
+	local function setupEnvironments()
+		
+		
+		
+		-- raw functions
+		
+		local raw_get_thread_identity = syn.get_thread_identity
+		local raw_set_thread_identity = syn.set_thread_identity
+		
+		local raw_checkcaller = checkcaller
+		local raw_hookfunction = hookfunction
+		local raw_hookmetamethod = hookmetamethod
+		
+		-- threads
+		
+		local getCurrentThread = coroutine.running
+		local threads = setmetatable({}, {__mode = "k"})
+		
+		local function isDuskThread()
+			return rawGetThreadIdentity == DUSK_THREAD_IDENTITY
+		end
+		
+		local function newGetThreadIdentity()
+			if isDuskThread() then
+				return raw_get_thread_identity()
+			end
+			
+			raw_get_thread_identity()
+		end
+		
+		-- must be restored from original thread
+		local function newSetThreadIdentity(n)
+			if isDuskThread() then
+				threads[getCurrentThread()] = true
+			end
+			
+			if n == DUSK_THREAD_IDENTITY and not threads[getCurrentThread()] then return end
+			
+			raw_set_thread_identity(n)
+		end
+		
+		
+		-- hooks
+		
+		
+		local function newhookfunction(target, hook)
+			return kernel.HookHandler:HookFunction(target, hook)
+		end
+		
+		local function newhookmetamethod(target, tag, hook, ...)
+			if typeof(target) == "Instance" then
+				if tag == "__index" then
+					return kernel.HookHandler:HookGameIndex(hook)
+				elseif tag == "__namecall" then
+					return kernel.HookHandler:HookGameNamecall(hook)
+				end
+			else
+				kernelAuditor:Log("unknown hook usage", target, tag, hook)
+				return raw_hookmetamethod(target, tag, hook, ...)
+			end
+		end
+		
+		-- misc
+		
+		local function gettenv()
+			return trustedEnvironment
+		end
+		
+		local function getutenv()
+			return untrustedEnvironment
+		end
+		
+		local function new_getgenv()
+			if isDuskThread() then
+				return trustedEnvironment
+			end
+			return untrustedEnvironment
+		end
+		
+		local function setupTrustedEnvironment()
+			
+			for name, value in pairs(baseLibrary) do
+				trustedEnvironment[name] = value
+			end
+			
+			trustedEnvironment.print = print
+			trustedEnvironment.warn = warn
+			trustedEnvironment.error = error
+			
+			trustedEnvironment.PatchHandler = patchHandler
+			trustedEnvironment.DuskObject = DuskObject
+			
+			trustedEnvironment.istrusted = true
+			trustedEnvironment.gettenv = gettenv
+			trustedEnvironment.getutenv = getutenv
+			trustedEnvironment.getgenv = new_getgenv
+			
+			trustedEnvironment.hookmetamethod = raw_hookmetamethod
+			trustedEnvironment.hookfunction = raw_hookfunction
+			
+			trustedEnvironment.isduskthread = isDuskThread
+			trustedEnvironment.getthreadidentity = newGetThreadIdentity
+			trustedEnvironment.setthreadidentity = newSetThreadIdentity
+			trustedEnvironment.checkcaller = raw_checkcaller
+			
+			-- raw functions
+			trustedEnvironment.decompile = decompile
+			trustedEnvironment.saveinstance = saveinstance
+			trustedEnvironment.loadstring = loadstring
+			trustedEnvironment.islclosure = islclosure
+			trustedEnvironment.newcclosure = newcclosure
+			trustedEnvironment.isnetworkowner = isnetworkowner
+			trustedEnvironment.gethiddenproperty = gethiddenproperty
+			trustedEnvironment.sethiddenproperty = sethiddenproperty
+			trustedEnvironment.setsimulationradius = setsimulationradius
+			
+			trustedEnvironment.getsenv = getsenv
+			trustedEnvironment.getcallingscript = getcallingscript
+			trustedEnvironment.getscriptclosure = getscriptclosure
+			trustedEnvironment.getscripthash = getscripthash
+			
+			trustedEnvironment.getrawmetatable = getrawmetatable
+			trustedEnvironment.setrawmetatable = setrawmetatable
+			trustedEnvironment.setreadonly = setreadonly
+			trustedEnvironment.isreadonly = isreadonly
+			
+			trustedEnvironment.readfile = raw_readfile
+			trustedEnvironment.writefile = raw_writefile
+			trustedEnvironment.appendfile = raw_appendfile
+			trustedEnvironment.listfiles = listfiles
+			trustedEnvironment.isfile = isfile
+			trustedEnvironment.isfolder = isfolder
+			trustedEnvironment.makefolder = makefolder
+			trustedEnvironment.delfolder = delfolder
+			trustedEnvironment.delfile = delfile
+			
+			trustedEnvironment.setclipboard = setclipboard
+			trustedEnvironment.setfflag = setfflag
+			trustedEnvironment.getnamecallmethod = getnamecallmethod
+			trustedEnvironment.setnamecallmethod = setnamecallmethod
+			trustedEnvironment.getsynasset = getsynasset
+			trustedEnvironment.getspecialinfo = getspecialinfo
+			trustedEnvironment.messagebox = messagebox
+			
+			trustedEnvironment.string = string
+			trustedEnvironment.table = table
+			trustedEnvironment.debug = debug
+			trustedEnvironment.bit = bit
+			trustedEnvironment.syn = syn
+		end
+		
+		local function patchUntrustedEnvironment()
+			
+			local function protectedCheckcaller()
+				return raw_checkcaller()
+			end
+			
+			local function patchBaseLib()
+				untrustedEnvironment.getgenv = newcclosure(new_getgenv)
+				untrustedEnvironment.hookmetamethod = newcclosure(newhookmetamethod)
+				untrustedEnvironment.hookfunction = newcclosure(newhookfunction)
+				untrustedEnvironment.checkcaller = newcclosure(protectedCheckcaller)
+			end
+			
+			local function patchSynLib()
+				setreadonly(syn, false)
+				syn.get_thread_identity = newcclosure(newGetThreadIdentity)
+				syn.set_thread_identity = newcclosure(newSetThreadIdentity)
+				setreadonly(syn, true)
+			end
+			
+			patchBaseLib()
+			patchSynLib()
+		end
+		
+		setupTrustedEnvironment()
+		patchUntrustedEnvironment()
+		
+		getrawmetatable(duskGlobalEnvironment).__index = trustedEnvironment
 	end
 	
 	local function setupGlobalEnvironment()
-		local genv = getgenv()
 		
-		if kernelSettings:GetField("InjectBaseLibraryInGlobalEnvironment") then
+		if kernelSettings:GetField("ModifyUntrustedEnvironment") then
 			
 			local function injectEnvironment()
-				local debugMode = kernelSettings:GetField("InjectBaseLibraryInGlobalEnvironment")
 				
-				for i, v in pairs(environment) do
-					if debugMode or not rawget(genv, i) then
-						rawset(genv, i, v)
+				local debugMode = kernelSettings:GetField("DebugModeEnabled")
+				local unionWithTrustedEnvironment = kernelSettings:GetField("UnionWithTrustedEnvironment")
+				local addBaseLibrary = kernelSettings:GetField("AddBaseLibrary")
+				local addKernelReference = kernelSettings:GetField("AddKernelReference")
+				local addTrustedEnvironmentReference = kernelSettings:GetField("AddTrustedEnvironmentReference")
+				
+				local function setfield(t, k, v)
+					if debugMode or not rawget(t, k) then
+						rawset(t, k, v)
 					else
-						baseLibrary.warnf("namespace conflict: %s already exists in global environment", i)
+						baseLibrary.warnf("namespace conflict: %s already exists in global environment", k)
 					end
 				end
+				
+				if unionWithTrustedEnvironment then
+					for i, v in pairs(trustedEnvironment) do
+						setfield(untrustedEnvironment, i, v)
+					end
+				else
+					for i, v in pairs(baseLibrary) do
+						setfield(untrustedEnvironment, i, v)
+					end
+					
+					if addKernelReference then
+						untrustedEnvironment.kernel = kernel
+					end
+					
+					if addTrustedEnvironmentReference then
+						trustedEnvironment.dusk = addTrustedEnvironmentReference
+					end
+				end
+				
 			end
 			
 			local function clearEnvironment()
 				
-				for i, v in pairs(environment) do
-					if rawget(genv, i) == v then
-						rawset(genv, i, nil)
+				for i, v in pairs(trustedEnvironment) do
+					if rawget(untrustedEnvironment, i) == v then
+						rawset(untrustedEnvironment, i, nil)
 					end
 				end
 				
-				rawset(genv, "dusk", nil)
+				if rawget(untrustedEnvironment, "dusk") == trustedEnvironment then
+					rawset(untrustedEnvironment, "dusk", nil)
+				end
 			end
 			
 			patchHandler:NewPatch(injectEnvironment, clearEnvironment):Run()
 		end
-		
-		genv.dusk = environment
 	end
+	
 	
 	function Kernel.new()
 		local self = setmetatable({}, Kernel)
 		
 		kernel = self
-		environment.kernel = self
+		trustedEnvironment.kernel = self
 		
 		self.Settings = kernelSettings
 		self.PatchHandler = patchHandler
@@ -738,7 +1037,7 @@ local Kernel = {} do
 		libraryHandler:AddLibrary(fs, "fs")
 		libraryHandler:AddLibrary(baseLibrary, "base")
 		
-		setupEnvironment()
+		setupEnvironments()
 		
 		self.HookHandler = self:_LoadKernelFile(HOOK_HANDLER_PATH, "HookHandler")
 		kernelModuleHandler:LoadModule("NetworkGuard")
@@ -746,7 +1045,10 @@ local Kernel = {} do
 		
 		libraryHandler:InitLibrary("cache")
 		libraryHandler:InitLibrary("input")
-		self:_LoadKernelFile(USER_PATH, "user")
+		
+		if kernelSettings:GetField("LoadUserComponents") then
+			self:_LoadKernelFile(USER_PATH, "user")
+		end
 		
 		setupGlobalEnvironment()
 		
@@ -760,22 +1062,27 @@ local Kernel = {} do
 		self.HookHandler:Destroy()
 	end
 	
+	function Kernel:Log(...)
+		local message = ""
+		
+		local size = select("#", ...)
+		for i = 1, size do
+			message ..= tostring(select(i, ...))
+			if i < size then
+				message ..= " "
+			end
+		end
+		
+		kernelAuditor:Log(message)
+	end
+	
 	function Kernel:_LoadKernelFile(path, name)
+		kernelAuditor:Log("LoadKernelFile:", name)
 		
 		local closure = assert(loadfile(path, name))
 		baseLibrary.assertf(closure, "unable to create %s closure", name)
 		
-		self:_InjectEnvironment(closure)
-		
 		return closure(self)
-	end
-	
-	function Kernel:_InjectEnvironment(closure)
-		local environment = getfenv(closure)
-		
-		for name, value in pairs(self:GetEnvironment()) do
-			rawset(environment, name, value)
-		end
 	end
 	
 	function Kernel:GetLibrary(name)
@@ -801,7 +1108,7 @@ local Kernel = {} do
 	end
 	
 	function Kernel:GetEnvironment()
-		return environment
+		return trustedEnvironment
 	end
 	
 	function Kernel:GetMainBaseClass()
@@ -812,3 +1119,5 @@ local Kernel = {} do
 end
 
 kernel = Kernel.new()
+
+warn("dusk loaded")
