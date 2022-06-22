@@ -1,11 +1,13 @@
 local DUSK_THREAD_IDENTITY = 8
-local CORE_FOLDER = "Dusk"
-local BASE_LIB_PATH = CORE_FOLDER .. "//blib.lua"
-local SETTINGS_PATH = CORE_FOLDER .. "//kernel.config"
-local FS_PATH = CORE_FOLDER .. "//fs.lua"
-local HOOK_HANDLER_PATH = CORE_FOLDER .. "//hooks.lua"
-local USER_PATH = CORE_FOLDER .. "//user.lua"
-local AUDITOR_LOG_PATH = CORE_FOLDER .. "log.txt"
+local CORE_FOLDER_PATH = "Dusk"
+
+local BASE_LIB_PATH = CORE_FOLDER_PATH .. "//blib.lua"
+local SETTINGS_PATH = CORE_FOLDER_PATH .. "//kernel.config"
+local FS_PATH = CORE_FOLDER_PATH .. "//fs.lua"
+local HOOK_HANDLER_PATH = CORE_FOLDER_PATH .. "//hooks.lua"
+local USER_PATH = CORE_FOLDER_PATH .. "//user.lua"
+
+local AUDITOR_LOG_FILENAME = "KernelLog.txt"
 
 local raw_readfile = readfile
 local raw_writefile = writefile
@@ -39,8 +41,8 @@ local DuskObject
 local KernelObject
 
 local rootFolder
-
 local patchHandler
+local obufferHandler
 
 do
 	local initData = {
@@ -48,23 +50,19 @@ do
 		TrustedEnvironment = trustedEnvironment
 	}
 	
-	
 	local function loadSettings()
 		rawSettings = game:GetService("HttpService"):JSONDecode(raw_readfile(SETTINGS_PATH))
 		initData.RawSettings = rawSettings
+	end
+	
+	local function createEnvironment()
+		initData.Environment = trustedEnvironment
 	end
 	
 	local function loadBaseLibrary()
 		baseLibrary = assert(loadfile(BASE_LIB_PATH, "blib")(initData))
 		initData.BaseLibrary = baseLibrary
 	end
-	
-	local function loadFileSystem()
-		fs = assert(loadfile(FS_PATH, "fs")(initData))
-		trustedEnvironment.fs = fs
-		rootFolder = initData.RootFolder
-	end
-	
 	
 	local function createMainBaseClasses()
 		
@@ -112,11 +110,11 @@ do
 			baseLibrary.buildFinalClass("DuskObject", DuskObject)
 		end
 		
-		initData.DuskObject = DuskObject
+		KernelObject = {}
+		baseLibrary.buildFinalClass("KernelObject", KernelObject, DuskObject)
 		
-		KernelObject = {} do
-			baseLibrary.buildFinalClass("KernelObject", KernelObject, DuskObject)
-		end
+		initData.DuskObject = DuskObject
+		initData.KernelObject = KernelObject
 	end
 	
 	local function createPatchHandler()
@@ -187,8 +185,11 @@ do
 		initData.PatchHandler = patchHandler
 	end
 	
-	local function createEnvironment()
-		initData.Environment = trustedEnvironment
+	local function loadFileSystem()
+		fs = assert(loadfile(FS_PATH, "fs")(initData))
+		trustedEnvironment.fs = fs
+		rootFolder = initData.RootFolder
+		obufferHandler = initData.OBufferHandler
 	end
 	
 	-- no requirements
@@ -264,56 +265,23 @@ local kernelAuditor do
 	
 	local KernelAuditor = {} do
 		
+		local logFile = kernelVariables.KernelFolder:NewFile(AUDITOR_LOG_FILENAME)
+		
 		function KernelAuditor.new()
 			local self = setmetatable({}, KernelAuditor)
 			
-			self.Buffer = ""
-			self.BufferSize = 0
-			
-			self.BufferWriteIndex = 0
-			self.MaxBufferSize = 2000
-			
-			self.NoDelay = false
-			self.WriteDelayTime = 5
-			self.LastBufferInputTime = 0
-			self.FirstBufferInputTime = nil
-			
-			raw_writefile(AUDITOR_LOG_PATH, "")
+			self.Buffer = obufferHandler:NewBuffer(logFile)
 			
 			return self
 		end
 		
-		function KernelAuditor:Write()
-			raw_appendfile(AUDITOR_LOG_PATH, self.Buffer)
-			self.Buffer = ""
-			self.BufferSize = 0
-			self.FirstBufferInputTime = nil
-		end
-		
 		local printLog = kernelSettings:GetField("PrintKernelLog")
+		
 		function KernelAuditor:Log(content)
+			self.Buffer:Write(content .. "\n")
 			if printLog then
 				print(content)
 			end
-			
-			content ..= "\n"
-			raw_appendfile(AUDITOR_LOG_PATH, content)
-			
-			-- TODO: implement file buffer class
-			--[[
-			self.Buffer ..= content
-			self.BufferSize = #self.Buffer
-			
-			if not self.FirstBufferInputTime then
-				self.FirstBufferInputTime = tick()
-			end
-			
-			if self.BufferSize > self.MaxBufferSize 
-				or self.FirstBufferInputTime > self.WriteDelayTime
-			then
-				self:Write()
-			end
-			]]
 		end
 		
 		baseLibrary.buildFinalSingleton("KernelAuditor", KernelAuditor, KernelObject)
@@ -373,7 +341,7 @@ local libraryHandler do
 				or  kernelVariables.UserLibraries[name]
 		end
 		
-		-- get library content, loaded it if its not loaded yet
+		-- get library content, load it if its not loaded yet
 		function LibraryHandler:GetLibrary(name)
 			local library = self:GetLoadedLibrary(name)
 			if library then
@@ -394,7 +362,7 @@ local libraryHandler do
 		
 		-- run library file and return it's content
 		function LibraryHandler:_RunLibrary(libraryFile)
-			kernelAuditor:Log("LibraryHandler:RunLibrary:", libraryFile.Path)
+			kernel:Log("LibraryHandler:RunLibrary:", libraryFile.Path)
 			
 			local libraryName = libraryFile.Name
 			local closure = loadstring(libraryFile:Read(), libraryName)
@@ -529,7 +497,7 @@ local userModuleHandler, kernelModuleHandler do
 		
 		function KernelModuleHandler:LoadModule(name)
 			local moduleFile = kernelVariables.KernelModules[name]
-			kernelAuditor:Log("KernelModuleHandler:LoadModule:", moduleFile.Path)
+			kernel:Log("KernelModuleHandler:LoadModule:", moduleFile.Path)
 			
 			local closure = loadstring(moduleFile:Read(), name)
 			
@@ -728,7 +696,7 @@ local userModuleHandler, kernelModuleHandler do
 				moduleFile = nameOrFile
 			end
 			
-			kernelAuditor:Log("UserModuleHandler:LoadModule:", moduleFile.Path)
+			kernel:Log("UserModuleHandler:LoadModule:", moduleFile.Path)
 			self:NewModule(moduleFile):Run()
 		end
 		
@@ -843,7 +811,7 @@ local Kernel = {} do
 					return kernel.HookHandler:HookGameNamecall(hook)
 				end
 			else
-				kernelAuditor:Log("unknown hook usage", target, tag, hook)
+				kernel:Log("unknown hook usage", target, tag, hook)
 				return raw_hookmetamethod(target, tag, hook, ...)
 			end
 		end
@@ -992,8 +960,10 @@ local Kernel = {} do
 						setfield(untrustedEnvironment, i, v)
 					end
 				else
-					for i, v in pairs(baseLibrary) do
-						setfield(untrustedEnvironment, i, v)
+					if addBaseLibrary then
+						for i, v in pairs(baseLibrary) do
+							setfield(untrustedEnvironment, i, v)
+						end
 					end
 					
 					if addKernelReference then
@@ -1058,8 +1028,9 @@ local Kernel = {} do
 	end
 	
 	function Kernel:Destroy()
-		patchHandler:Destroy()
 		self.HookHandler:Destroy()
+		patchHandler:Destroy()
+		obufferHandler:Destroy()
 	end
 	
 	function Kernel:Log(...)
@@ -1077,7 +1048,7 @@ local Kernel = {} do
 	end
 	
 	function Kernel:_LoadKernelFile(path, name)
-		kernelAuditor:Log("LoadKernelFile:", name)
+		kernel:Log("LoadKernelFile:", name)
 		
 		local closure = assert(loadfile(path, name))
 		baseLibrary.assertf(closure, "unable to create %s closure", name)
@@ -1119,5 +1090,9 @@ local Kernel = {} do
 end
 
 kernel = Kernel.new()
+
+game.OnClose = function()
+	obufferHandler:Destroy()
+end
 
 warn("dusk loaded")

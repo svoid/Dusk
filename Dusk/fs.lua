@@ -1,3 +1,5 @@
+-- initializes output buffer handler, creates a reference for it in initData
+
 local initData = ...
 
 local rawSettings = initData.RawSettings
@@ -28,6 +30,176 @@ local originals = {
 	syn_io_isfolder = syn_io_isfolder,
 }
 
+
+local obufferHandler
+
+
+local OBuffer = {} do
+	
+	function OBuffer.new(file)
+		expectClass(file, "File")
+		
+		local self = setmetatable({}, OBuffer)
+		
+		self.File = file
+		
+		self.Buffer = ""
+		self.Size = 0
+		self.MaxSize = 5000
+		
+		self.LastWrite = 0
+		self.Writes = 0
+		
+		self.DelayTime = 3
+		
+		obufferHandler:AddBuffer(self)
+		
+		return self
+	end
+	
+	function OBuffer:Destroy()
+		if self.Size > 0 then
+			self:Append()
+		end
+		obufferHandler:RemoveBuffer(self)
+	end
+	
+	function OBuffer:Append()
+		self.File:Append(self.Buffer)
+		self.Buffer = ""
+		self.Size = 0
+	end
+	
+	function OBuffer:_DelayedAppend(checkTime, delay)
+		if self.Size > 0 and checkTime - self.LastWrite > delay then
+			self:Append()
+		end
+	end
+	
+	if rawSettings.FastFileBuffers then
+		function OBuffer:Write(string)
+			self.Writes += 1
+			
+			local newBuffer = self.Buffer .. string
+			local newSize = #string
+			
+			if newSize >= self.MaxSize then
+				self.File:Append(newBuffer)
+				self.Buffer = ""
+				self.Size = 0
+				return
+			end
+			
+			self.Buffer = newBuffer
+			self.Size = newSize
+		end
+	else
+		function OBuffer:Write(string)
+			expectType(string, "string")
+			self.Writes += 1
+			self.LastWrite = tick()
+			
+			self.Buffer ..= string
+			self.Size = #string
+			if self.Size >= self.MaxSize then
+				self:Append()
+				return
+			end
+		end
+	end
+	
+	baseLibrary.buildFinalClass("OBuffer", OBuffer)
+end
+
+
+local IBuffer = {} do
+	
+	function IBuffer.new(fileOrString)
+		local buffer
+		if type(fileOrString) == "string" then
+			buffer = fileOrString
+		else
+			buffer = expectClass(fileOrString, "File"):Read()
+		end
+		
+		local self = setmetatable({}, IBuffer)
+		
+		self.Buffer = buffer
+		self.Position = 0
+		
+		return self
+	end
+	
+	function IBuffer:Read(size)
+		size = size or 1
+		
+		local startPosition = self.Position
+		local endPosition = startPosition + size
+		
+		local result = self.Buffer:sub(startPosition, endPosition)
+		
+		self.Position = endPosition
+		
+		return result
+	end
+	
+	baseLibrary.buildFinalClass("IBuffer", IBuffer)
+end
+
+
+local OBufferHandler = {} do
+	
+	function OBufferHandler.new()
+		local self = setmetatable({}, OBufferHandler)
+		
+		self.ActiveBuffers = {}
+		self.WriteDelayTime = 2
+		self.Active = true
+		
+		task.spawn(function()
+			while self.Active do
+				local checkTime = tick()
+				local delay = self.WriteDelayTime
+				
+				for _, obuffer in next, self.ActiveBuffers do
+					obuffer:_DelayedAppend(checkTime, delay)
+				end
+				
+				task.wait(delay)
+			end
+		end)
+		
+		return self
+	end
+	
+	function OBufferHandler:NewBuffer(file)
+		return OBuffer.new(file)
+	end
+	
+	function OBufferHandler:AddBuffer(obuffer)
+		table.insert(self.ActiveBuffers, obuffer)
+	end
+	
+	function OBufferHandler:RemoveBuffer(obuffer)
+		local buffers = self.ActiveBuffers
+		table.remove(buffers, assert(table.find(buffers, obuffer), "invalid obuffer index"))
+	end
+	
+	function OBufferHandler:Destroy()
+		self.Active = false
+		local buffers = self.ActiveBuffers
+		for i = #buffers, 1, -1 do
+			buffers[i]:Destroy()
+		end
+	end
+	
+	baseLibrary.buildFinalSingleton("OBufferHandler", OBufferHandler, initData.KernelObject)
+end
+
+obufferHandler = OBufferHandler.new()
+initData.OBufferHandler = obufferHandler
+
+
 local OSInstance = {} do
 	
 	function OSInstance.new(path)
@@ -53,6 +225,7 @@ local OSInstance = {} do
 	
 	baseLibrary.buildFinalClass("OSInstance", OSInstance, initData.DuskObject)
 end
+
 
 local File = {} do
 	
@@ -80,15 +253,16 @@ local File = {} do
 	
 	function File:Append(content)
 		expectType(content, "string")
-		return originals.readfile(self.Path, content)
+		return originals.appendfile(self.Path, content)
 	end
 	
 	function File:Write(content)
-		return originals.readfile(self.Path, content)
+		return originals.writefile(self.Path, content)
 	end
 	
 	baseLibrary.buildFinalClass("File", File, OSInstance)
 end
+
 
 local Folder = {} do
 	
@@ -154,10 +328,14 @@ local Folder = {} do
 	end
 	
 	function Folder:NewFile(name, content)
+		content = content or ""
+
 		expectType(name, "string")
 		expectType(content, "string")
+		
 		local path = self.Path .. "\\" .. name
-		originals.writefile(path, content or "")
+		originals.writefile(path, content)
+		
 		return self:SyncFile(path)
 	end
 	
@@ -245,6 +423,7 @@ local Folder = {} do
 	vftable = baseLibrary.buildFinalClassOverride("Folder", Folder, override, OSInstance)
 end
 
+
 local root = Folder.new("")
 root:Sync()
 initData.RootFolder = root
@@ -282,121 +461,6 @@ if rawSettings.FileSystemSandbox then
 	end
 	
 	initData.PatchHandler:NewPatch(override, repair):Run()
-end
-
-
-local OBuffer = {} do
-	
-	function OBuffer.new(file)
-		expectClass(file, "File")
-		
-		local self = setmetatable({}, OBuffer)
-		
-		self.File = file
-		
-		self.Buffer = ""
-		self.Size = 0
-		self.MaxSize = 5000
-		
-		self.LastWrite = 0
-		self.Writes = 0
-		
-		self.DelayTime = 3
-		return self
-	end
-	
-	function OBuffer:Destroy()
-		if self.Size > 0 then
-			self:Append()
-		end
-	end
-	
-	function OBuffer:Append()
-		self.File:Append(self.Buffer)
-		self.Buffer = ""
-		self.Size = 0
-	end
-	
-	if rawSettings.FastFileBuffers then
-		function OBuffer:Write(string)
-			self.Writes += 1
-			
-			local newBuffer = self.Buffer .. string
-			local newSize = #string
-			
-			if newSize >= self.MaxSize then
-				self.File:Append(newBuffer)
-				self.Buffer = ""
-				self.Size = 0
-				return
-			end
-			
-			self.Buffer = newBuffer
-			self.Size = newSize
-			
-			local thisWrites = self.Writes
-			task.wait(self.DelayTime)
-			if thisWrites == self.Writes then
-				self.File:Append(newBuffer)
-				self.Buffer = ""
-				self.Size = 0
-			end
-		end
-	else
-		function OBuffer:Write(string)
-			expectType(string, "string")
-			self.Writes += 1
-			
-			self.Buffer ..= string
-			self.Size = #string
-			if self.Size >= self.MaxSize then
-				self:Append()
-				return
-			end
-			
-			local thisWrites = self.Writes
-			task.wait(self.DelayTime)
-			if thisWrites == self.Writes then
-				self:Append()
-			end
-		end
-	end
-	
-	baseLibrary.buildFinalClass("OBuffer", OBuffer)
-end
-
-local IBuffer = {} do
-	
-	function IBuffer.new(fileOrString)
-		local buffer
-		if type(fileOrString) == "string" then
-			buffer = fileOrString
-		else
-			buffer = expectClass(fileOrString, "File"):Read()
-		end
-		
-		local self = setmetatable({}, IBuffer)
-		
-		self.Buffer = buffer
-		self.Position = 0
-		
-		return self
-	end
-	
-	function IBuffer:Read(size)
-		size = size or 1
-		
-		local startPosition = self.Position
-		local endPosition = startPosition + size
-		
-		local result = self.Buffer:sub(startPosition, endPosition)
-		
-		self.Position = endPosition
-		
-		return result
-	end
-	
-	baseLibrary.buildFinalClass("IBuffer", IBuffer)
 end
 
 

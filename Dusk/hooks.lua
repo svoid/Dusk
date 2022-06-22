@@ -278,7 +278,6 @@ local HookHandler = {} do
 	
 	function HookHandler:HookGameNamecall(name, instance, handler)
 		self.GameNamecallHookHandler:NewHook(name, instance, handler)
-		warn(self.GameNamecallHookHandler.RawNamecall)
 		return self.GameNamecallHookHandler.RawNamecall
 	end
 	
